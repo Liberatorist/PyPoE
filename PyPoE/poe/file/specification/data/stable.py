@@ -20125,17 +20125,8 @@ specification = Specification(
                     type="ref|list|int",
                 ),
                 Field(
-                    name="Art",
-                    type="ref|string",
-                ),
-                Field(
                     name="TotalIndices",
                     type="int",
-                ),
-                Field(
-                    name="SoundEffectsKey",
-                    type="ref|out",
-                    key="SoundEffects.dat",
                 ),
             ),
         ),
