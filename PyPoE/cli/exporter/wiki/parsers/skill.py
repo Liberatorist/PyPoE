@@ -532,9 +532,14 @@ class SkillParserShared(parser.BaseParser):
         act_skill = gra_eff["ActiveSkill"]
         if act_skill:
             try:
-                tf = self.tc[self.skill_stat_filter.skills[act_skill["Id"]].translation_file_path]
+                base_skill_id = (
+                    act_skill["TransfigureBase"]["Id"]
+                    if act_skill["TransfigureBase"]
+                    else act_skill["Id"]
+                )
+                tf = self.tc[self.skill_stat_filter.skills[base_skill_id].translation_file_path]
             except KeyError as e:
-                warnings.warn("Missing active skill in stat filers: %s" % e.args[0])
+                warnings.warn("Missing active skill in stat files: %s" % e.args[0])
                 tf = self.tc["skill_stat_descriptions.txt"]
 
             if parsed_args.store_images and act_skill["Icon_DDSFile"]:
@@ -584,22 +589,23 @@ class SkillParserShared(parser.BaseParser):
                 for stat_index, r in enumerate(lvl_stats["FloatStats"])
                 if stat_index < len(lvl_stats["BaseResolvedValues"])
             ] + [r["Id"] for r in lvl_stats["AdditionalStats"]]
-            values = lvl_stats["BaseResolvedValues"] + lvl_stats["AdditionalStatsValues"]
+            values = defaultdict(lambda: 0)
+            for k, v in zip(
+                stats + const_stats + impl_stats,
+                lvl_stats["BaseResolvedValues"]
+                + lvl_stats["AdditionalStatsValues"]
+                + const_stat_vals
+                + impl_stat_vals,
+            ):
+                values[k] = values[k] + v
 
             # Remove 0 (unused) stats
             # This will remove all +0 gem level entries.
-            remove_ids = [stat for stat, value in zip(stats, values) if value == 0]
-            for stat_id in remove_ids:
-                index = stats.index(stat_id)
-                if values[index] == 0:
-                    del stats[index]
-                    del values[index]
+            stats = [stat for stat in stats if values[stat]]
 
             translated_stats = self._translate_stats(
                 stats,
-                dict(
-                    zip(stats + const_stats + impl_stats, values + const_stat_vals + impl_stat_vals)
-                ),
+                values,
                 tf,
                 data,
                 stat_order,
@@ -662,17 +668,13 @@ class SkillParserShared(parser.BaseParser):
             last = data
 
         # GrantedEffectStatSets.dat64
-        const_stats = [untr_stat["Id"] for untr_stat in stat_set["ConstantStats"]]
-        impl_stats = [untr_stat["Id"] for untr_stat in stat_set["ImplicitStats"]]
-        const_stat_vals = stat_set["ConstantStatsValues"]
-
         const_data = defaultdict()
-        impl_data = defaultdict()
         const_tr_stats = self._translate_stats(
-            const_stats, const_stat_vals, tf, const_data, stat_order
-        )
-        impl_tr_stats = self._translate_stats(
-            impl_stats, [1 for i in range(len(impl_stats))], tf, impl_data, stat_order
+            [stat for stat in const_stats + impl_stats if stat not in dynamic["stat_keys"]],
+            dict(zip(const_stats + impl_stats, const_stat_vals + impl_stat_vals)),
+            tf,
+            const_data,
+            stat_order,
         )
 
         # Later code that generates the infobox expects static stats to be in static,
@@ -683,12 +685,6 @@ class SkillParserShared(parser.BaseParser):
             static["stat_keys"].update(const_data["stats"][tr_stat]["stats"])
             level_data[0]["stats"][tr_stat] = const_data["stats"][tr_stat]
             stat_key_order["stats"][tr_stat] = const_tr_stats[tr_stat]
-
-        for tr_stat in impl_tr_stats.keys():
-            static["stats"][tr_stat] = impl_tr_stats[tr_stat]
-            static["stat_keys"].update(impl_data["stats"][tr_stat]["stats"])
-            level_data[0]["stats"][tr_stat] = impl_data["stats"][tr_stat]
-            stat_key_order["stats"][tr_stat] = impl_tr_stats[tr_stat]
 
         stat_key_order["stats"] = OrderedDict(
             sorted(
@@ -758,36 +754,18 @@ class SkillParserShared(parser.BaseParser):
             if row["GrantedEffectsKey"] == gra_eff:
                 qual_stats.append(row)
 
-        qual_stats.sort(key=lambda row: row["SetId"])
-
         for row in qual_stats:
-            prefix = "quality_type%s_" % (row["SetId"] + 1)
-            infobox[prefix + "weight"] = row["Weight"]
+            prefix = "quality_type1_"
+            infobox[prefix + "weight"] = 1
 
             # Quality stat data
             stat_ids = [r["Id"] for r in row["StatsKeys"]]
 
             abs_stats = [abs(v) for v in row["StatsValuesPermille"]]
-            lowest = max(
-                50,
-                min(
-                    1000,
-                    max(
-                        # for values that don't increase smoothly per point,
-                        # find the greatest factor that does:
-                        # value of 750 (.75 per point) => 250 (breakpoint = 4)
-                        # value of 1500 (1.5 per point) => 500 (breakpoint = 2)
-                        next(
-                            filter(
-                                lambda n: n and 1000 % n == 0, map(lambda n: v // n, range(1, 21))
-                            ),
-                            v,
-                        )
-                        for v in abs_stats
-                    ),
-                ),
-            )
-            breakpoint = 1000 // lowest
+            lowest = max(50, min(1000, min(abs_stats)))
+            breakpoints = [
+                str(v) for v in sorted(set(1000 / v for v in abs_stats if v and v < 1000))
+            ]
 
             bp_tr = tf.get_translation(
                 tags=stat_ids,
@@ -802,49 +780,35 @@ class SkillParserShared(parser.BaseParser):
                 lang=config.get_option("language"),
             )
 
+            # Use the translation that shows the most values
+            # e.g. "(5-100)% chance to not pierce" rather than "Cannot pierce"
             qtr = (
                 q40_tr
-                if sum(len(ids) for ids in q40_tr.found_ids)
-                >= sum(len(ids) for ids in bp_tr.found_ids)
+                if sum(len(ts.tags) for ts in q40_tr.string_instances)
+                >= sum(len(ts.tags) for ts in bp_tr.string_instances)
                 else bp_tr
             )
 
             lines = []
-            bp_lines = []
             for ts in qtr.string_instances:
                 values = []
                 for stat_id in ts.translation.ids:
                     try:
                         v = row["StatsValuesPermille"][stat_ids.index(stat_id)]
-                        values.append(v / 1000)
+                        values.append((v / 1000, v / 50))
                     except ValueError:
                         values.append(0)
                 lines.extend(
                     ts.format_string(
                         values=values,
-                        is_range=[False for _ in values],
-                        custom_formatter=str,
-                    )[0].split("\n")
-                )
-            for ts in bp_tr.string_instances:
-                values = []
-                for stat_id in ts.translation.ids:
-                    try:
-                        v = row["StatsValuesPermille"][stat_ids.index(stat_id)]
-                        values.append(v * breakpoint / 1000)
-                    except ValueError:
-                        values.append(0)
-                bp_lines.extend(
-                    ts.format_string(
-                        values=values,
-                        is_range=[False for v in values],
+                        is_range=[bool(v) for v in values],
                         custom_formatter=str,
                     )[0].split("\n")
                 )
 
             infobox[prefix + "stat_text"] = "<br>".join(lines)
-            infobox[prefix + "stat_breakpoint"] = breakpoint
-            infobox[prefix + "stat_per_breakpoint"] = "<br>".join(bp_lines)
+            if breakpoints:
+                infobox[prefix + "breakpoints"] = ",".join(breakpoints)
 
             self._write_stats(
                 infobox,
@@ -1079,12 +1043,17 @@ class SkillParser(SkillParserShared):
     def export(self, parsed_args, skills):
         self._image_init(parsed_args=parsed_args)
         console("Found %s skills, parsing..." % len(skills))
-        self.rr["SkillGems.dat64"].build_index("GrantedEffectsKey")
+        self.rr["GemEffects.dat64"].build_index("GrantedEffect")
+        self.rr["SkillGems.dat64"].build_index("GemEffects")
         r = ExporterResult()
         for skill in skills:
             if (
                 not parsed_args.allow_skill_gems
-                and skill in self.rr["SkillGems.dat64"].index["GrantedEffectsKey"]
+                and skill in self.rr["GemEffects.dat64"].index["GrantedEffect"]
+                and any(
+                    effect in self.rr["SkillGems.dat64"].index["GemEffects"]
+                    for effect in self.rr["GemEffects.dat64"].index["GrantedEffect"][skill]
+                )
             ):
                 console(
                     f"Skipping skill gem skill \"{skill['Id']}\" at row {skill.rowid}",

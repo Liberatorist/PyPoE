@@ -32,14 +32,20 @@ Kishara's Star (item)
 # Imports
 # =============================================================================
 
+import codecs
 import os
 
 # Python
 import re
+import struct
 import warnings
 from collections import OrderedDict, defaultdict
+from dataclasses import dataclass
 from functools import partialmethod
 from pathlib import Path
+
+import matplotlib.colors
+import numpy as np
 
 # 3rd-party
 from PIL import Image, ImageOps
@@ -57,13 +63,26 @@ from PyPoE.cli.exporter.wiki.parsers.skill import SkillParserShared
 
 # Self
 from PyPoE.poe.constants import RARITY
-from PyPoE.poe.file.dat import RelationalReader
+from PyPoE.poe.file.dat import DatReader, RelationalReader
 from PyPoE.poe.file.it import ITFile
 from PyPoE.poe.sim.formula import GemTypes, gem_stat_requirement
 
 # =============================================================================
 # Functions
 # =============================================================================
+
+
+@dataclass
+class GemShadeConstants:
+    hue_factor: float
+    sat_factor: float
+    val_factor: float
+    lum_factor: float
+
+
+def gemshade_constants_from_hex(hex_text: str):
+    buf = codecs.decode(hex_text.replace(" ", ""), "hex")
+    return GemShadeConstants(*struct.unpack("<ffff", buf))
 
 
 def _apply_column_map(infobox, column_map, list_object):
@@ -78,20 +97,30 @@ def _apply_column_map(infobox, column_map, list_object):
 
 
 def _type_factory(
-    data_file, data_mapping, row_index=True, function=None, fail_condition=False, skip_warning=False
+    data_file,
+    data_mapping,
+    row_index=True,
+    function=None,
+    fail_condition=False,
+    skip_warning=False,
+    index_column="BaseItemTypesKey",
 ):
     def func(self, infobox, base_item_type):
-        try:
-            if data_file == "BaseItemTypes.dat64":
-                data = base_item_type
-            else:
-                data = self.rr[data_file].index["BaseItemTypesKey"][
-                    base_item_type.rowid if row_index else base_item_type["Id"]
-                ]
-        except KeyError:
-            if not skip_warning:
-                warnings.warn(f'Missing {data_file} info for "{base_item_type["Name"]}"')
-            return fail_condition
+        if data_file == "BaseItemTypes.dat64":
+            data = base_item_type
+        else:
+            file: DatReader = self.rr[data_file]
+            idx = base_item_type.rowid if row_index else base_item_type["Id"]
+
+            if index_column not in file.index:
+                file.build_index(index_column)
+
+            try:
+                data = file.index[index_column][idx]
+            except KeyError:
+                if not skip_warning:
+                    warnings.warn(f'Missing {data_file} info for "{base_item_type["Name"]}"')
+                return fail_condition
 
         _apply_column_map(infobox, data_mapping, data)
 
@@ -124,6 +153,21 @@ def _colorize_rgba(img, black, white, mid=None, blackpoint=0, whitepoint=255, mi
 
 
 # =============================================================================
+# Constants
+# =============================================================================
+
+
+SHADE_LUT: dict[(str, int), GemShadeConstants] = {
+    ("str", 1): gemshade_constants_from_hex("60 E5 50 BD 6F 12 83 BD 4E 62 90 3E 08 AC 1C 3F"),
+    ("str", 2): gemshade_constants_from_hex("60 E5 50 BE B6 F3 7D 3E 33 33 B3 BE BA 49 4C 3F"),
+    ("dex", 1): gemshade_constants_from_hex("9A 99 19 BE F4 FD 54 BD D1 22 5B 3E F0 A7 46 3F"),
+    ("dex", 2): gemshade_constants_from_hex("B8 1E 85 3E 0A D7 A3 3D 19 04 16 BF 23 DB 39 3F"),
+    ("int", 1): gemshade_constants_from_hex("AE 47 E1 BD AE 47 61 BE 0A D7 23 BD 00 00 80 3F"),
+    ("int", 2): gemshade_constants_from_hex("8F C2 75 3D 0A D7 23 3D 0A D7 A3 BD 00 00 80 3F"),
+}
+
+
+# =============================================================================
 # Classes
 # =============================================================================
 
@@ -146,6 +190,7 @@ class WikiCondition(parser.WikiCondition):
         "frame_type",
         "influences",
         "card_background",
+        "skill_icon",
         # Drop restrictions
         "drop_enabled",
         "acquisition_tags",
@@ -154,6 +199,7 @@ class WikiCondition(parser.WikiCondition):
         "drop_monsters",
         "is_drop_restricted",
         "drop_level_maximum",
+        "drop_rarities_ids",
         # Item flags
         "is_corrupted",
         "is_mirrored",
@@ -163,7 +209,6 @@ class WikiCondition(parser.WikiCondition):
         "is_eater_of_worlds_item",
         "is_veiled",
         "is_replica",
-        "is_relic",
         "can_not_be_traded_or_modified",
         "is_sellable",
         "is_in_game",
@@ -171,7 +216,7 @@ class WikiCondition(parser.WikiCondition):
         "is_account_bound",
         "suppress_improper_modifiers_category",
         "disable_automatic_recipes",
-        # MTX Categorization (No longer exposed in BaseItemTypes.dat)
+        # MTX Categorization
         "cosmetic_type",
         # Version information
         "release_version",
@@ -428,6 +473,7 @@ class ItemsParser(SkillParserShared):
         "Sanctum": "3.20.0",  # AKA The Forbidden Sanctum
         "Crucible": "3.21.0",
         "Ancestral": "3.22.0",  # AKA Trial of the Ancestors
+        "Azmeri": "3.23.0",  # AKA Affliction
     }
 
     _IGNORE_DROP_LEVEL_CLASSES = (
@@ -842,6 +888,10 @@ class ItemsParser(SkillParserShared):
             "Metadata/Items/UniqueFragments/FragmentUniqueHelmet1_1": " (1 of 3)",
             "Metadata/Items/UniqueFragments/FragmentUniqueHelmet1_2": " (2 of 3)",
             "Metadata/Items/UniqueFragments/FragmentUniqueHelmet1_3": " (3 of 3)",
+            "Metadata/Items/UniqueFragments/FragmentUniqueMap26_1": " (1 of 4)",
+            "Metadata/Items/UniqueFragments/FragmentUniqueMap26_2": " (2 of 4)",
+            "Metadata/Items/UniqueFragments/FragmentUniqueMap26_3": " (3 of 4)",
+            "Metadata/Items/UniqueFragments/FragmentUniqueMap26_4": " (4 of 4)",
             # =================================================================
             # Cosmetic items
             # =================================================================
@@ -905,6 +955,11 @@ class ItemsParser(SkillParserShared):
             "Metadata/Items/Relics/SanctumSpecialRelic1": " (strength)",
             "Metadata/Items/Relics/SanctumSpecialRelic2": " (dexterity)",
             "Metadata/Items/Relics/SanctumSpecialRelic3": " (intelligence)",
+            # =================================================================
+            # Corpse items
+            # =================================================================
+            "Metadata/Items/ItemisedCorpses/HydraMid": " (corpse item)",
+            "Metadata/Items/ItemisedCorpses/OakMid": " (corpse item)",
         },
         "Russian": {
             # =================================================================
@@ -2021,6 +2076,7 @@ class ItemsParser(SkillParserShared):
         "Metadata/Items/MicrotransactionCurrency/MicrotransactionUpgradeScrollS21",
         "Metadata/Items/MicrotransactionCurrency/MicrotransactionUpgradeScrollS22",
         "Metadata/Items/MicrotransactionCurrency/MicrotransactionUpgradeScrollS23",
+        "Metadata/Items/MicrotransactionCurrency/MicrotransactionUpgradeScrollS24",
         "Metadata/Items/MicrotransactionCurrency/MicrotransactionSalvageFragmentSmall",
         "Metadata/Items/MicrotransactionCurrency/MicrotransactionSalvageFragment",
         "Metadata/Items/MicrotransactionCurrency/MicrotransactionSalvageFragmentLarge",
@@ -2280,6 +2336,10 @@ class ItemsParser(SkillParserShared):
         "Metadata/Items/MicrotransactionCurrency/ProxySkinTransferPack10",
         "Metadata/Items/MicrotransactionCurrency/ProxySkinTransferPack50",
         "Metadata/Items/MicrotransactionCurrency/TradeMarketBuyoutTabTemporary",
+        "Metadata/Items/MicrotransactionItemEffects/MicrotransactionAltLioneyesGlare",
+        "Metadata/Items/MicrotransactionItemEffects/MicrotransactionAlchemistsBelt",
+        "Metadata/Items/MicrotransactionSkillEffects/MicrotransactionAnnihilationSmiteEffect",
+        "Metadata/Items/MicrotransactionItemEffects/MicrotransactionSurvivorsGogglesHelmetAttachment",  # noqa
         # =================================================================
         # Hideout decorations
         # =================================================================
@@ -2516,6 +2576,25 @@ class ItemsParser(SkillParserShared):
         "Metadata/Items/Currency/SanctumCurrencyWindDancer",
         "Metadata/Items/Currency/SanctumCurrencyZealotsOath",
         # =================================================================
+        # Divination cards
+        # =================================================================
+        "Metadata/Items/DivinationCards/DivinationCardHisJudgement",
+        # =================================================================
+        # Corpse items
+        # =================================================================
+        "Metadata/Items/ItemisedCorpses/FlameblasterLow",
+        "Metadata/Items/ItemisedCorpses/FlameblasterMid",
+        "Metadata/Items/ItemisedCorpses/FlameblasterHigh",
+        "Metadata/Items/ItemisedCorpses/ForgeHoundLow",
+        "Metadata/Items/ItemisedCorpses/ForgeHoundMid",
+        "Metadata/Items/ItemisedCorpses/ForgeHoundHigh",
+        "Metadata/Items/ItemisedCorpses/SlammerDemonLow",
+        "Metadata/Items/ItemisedCorpses/SlammerDemonMid",
+        "Metadata/Items/ItemisedCorpses/SlammerDemonHigh",
+        "Metadata/Items/ItemisedCorpses/DeathKnightLow",
+        "Metadata/Items/ItemisedCorpses/DeathKnightMid",
+        "Metadata/Items/ItemisedCorpses/DeathKnightHigh",
+        # =================================================================
         # Quest items
         # =================================================================
         "Metadata/Items/QuestItems/ShaperMemoryFragments/ShaperMemoryFragment1_1",
@@ -2533,6 +2612,7 @@ class ItemsParser(SkillParserShared):
         "Metadata/Items/QuestItems/ShaperMemoryFragments/ShaperMemoryFragment10_1",
         "Metadata/Items/QuestItems/ShaperMemoryFragments/ShaperMemoryFragment10_2",
         "Metadata/Items/QuestItems/ShaperMemoryFragments/ShaperMemoryFragment10_3",
+        "Metadata/Items/Heist/QuestItems/HeistFinalObjectiveQuestFaustus1B",
         # =================================================================
         # Misc
         # =================================================================
@@ -2628,13 +2708,40 @@ class ItemsParser(SkillParserShared):
         except KeyError:
             return False
 
+        result = []
+        for gem_type in skill_gem["GemEffects"]:
+            copy = infobox.copy()
+            if self._skill_gem_type(copy, base_item_type, skill_gem, gem_type):
+                result.append(copy)
+
+        return result
+
+    def _skill_gem_type(self, infobox: OrderedDict, base_item_type, skill_gem, gem_type):
+        name = gem_type["Name"]
+        if "[DNT]" in name:
+            return False
+        if skill_gem["IsVaalVariant"]:
+            infobox["is_vaal_skill_gem"] = "true"
+            if gem_type["ItemColor"] != 3:
+                return False
+        if skill_gem["VaalVariant_BaseItemTypesKey"]:
+            infobox["vaal_variant_id"] = skill_gem["VaalVariant_BaseItemTypesKey"]["Id"]
+        if skill_gem["RegularVariant"]:
+            infobox["is_awakened_support_gem"] = "true"
+        if skill_gem["AwakenedVariant"]:
+            infobox["awakened_variant_id"] = skill_gem["AwakenedVariant"]["BaseItemTypesKey"]["Id"]
+        if name:
+            infobox["name"] = name
+            infobox["base_item_id"] = infobox.pop("metadata_id")
+
         # SkillGems.dat
         for attr_short, attr_long in self._attribute_map.items():
             if not skill_gem[attr_short]:
                 continue
             infobox[attr_long + "_percent"] = skill_gem[attr_short]
 
-        infobox["gem_tags"] = ", ".join([gt["Tag"] for gt in skill_gem["GemTagsKeys"] if gt["Tag"]])
+        infobox["gem_tags"] = ", ".join([gt["Tag"] for gt in gem_type["GemTags"] if gt["Tag"]])
+        infobox["gem_shader"] = gem_type["ItemColor"]
 
         # No longer used
         #
@@ -2659,14 +2766,14 @@ class ItemsParser(SkillParserShared):
             exp_total = [0]
 
         max_level = len(exp_total) - 1
-        ge = skill_gem["GrantedEffectsKey"]
+        ge = gem_type["GrantedEffect"]
 
         primary = OrderedDict()
         self._skill(
             gra_eff=ge,
             infobox=primary,
             parsed_args=self._parsed_args,
-            msg_name=base_item_type["Name"],
+            msg_name=gem_type["Name"],
             max_level=max_level,
         )
 
@@ -2675,24 +2782,23 @@ class ItemsParser(SkillParserShared):
         # Currently there is no great way of handling this in the wiki, so the
         # secondary effects are just added. Skills that have their own entry
         # are excluded so we don't get vaal skill gems here.
-        second = False
-        if skill_gem["GrantedEffectsKey2"]:
+        second = gem_type["GrantedEffect2"]
+        if second:
             index = None
             try:
-                index = self.rr["SkillGems.dat64"].index["GrantedEffectsKey"]
+                index = self.rr["GemEffects.dat64"].index["GrantedEffect"]
             except KeyError:
-                self.rr["SkillGems.dat64"].build_index("GrantedEffectsKey")
-                index = self.rr["SkillGems.dat64"].index["GrantedEffectsKey"]
+                self.rr["GemEffects.dat64"].build_index("GrantedEffect")
+                index = self.rr["GemEffects.dat64"].index["GrantedEffect"]
 
-            if not index[skill_gem["GrantedEffectsKey2"]]:
-                # If there is no skill granting this it's probably fine to
-                # include.
-                second = True
+            if index[second]:
+                # If there is a skill granting this as its primary effect, skip it
+                second = False
 
         if second:
             secondary = OrderedDict()
             self._skill(
-                gra_eff=skill_gem["GrantedEffectsKey2"],
+                gra_eff=second,
                 infobox=secondary,
                 parsed_args=self._parsed_args,
                 msg_name=base_item_type["Name"],
@@ -2787,10 +2893,9 @@ class ItemsParser(SkillParserShared):
             for k, v in primary.items():
                 infobox[k] = v
 
-        # some descriptions come from active skills which are parsed in above
-        # function
+        # some descriptions come from active skills which are parsed in above function
         if "gem_description" not in infobox:
-            infobox["gem_description"] = skill_gem["Description"].replace("\n", "<br>")
+            infobox["gem_description"] = gem_type["SupportText"].replace("\n", "<br>")
 
         #
         # Output handling for progression
@@ -3082,17 +3187,6 @@ class ItemsParser(SkillParserShared):
     )
 
     def _currency_extra(self, infobox, base_item_type, currency):
-        # Add the "shift click to unstack" stuff to currency-ish items
-        if currency["Stacks"] > 1 and infobox["class_id"] not in ("Microtransaction",):
-            if "help_text" in infobox:
-                infobox["help_text"] += "<br>"
-            else:
-                infobox["help_text"] = ""
-
-            infobox["help_text"] += self.rr["ClientStrings.dat64"].index["Id"][
-                "ItemDisplayStackDescription"
-            ]["Text"]
-
         if infobox.get("description"):
             infobox["description"] = parser.parse_and_handle_description_tags(
                 rr=self.rr,
@@ -3135,6 +3229,7 @@ class ItemsParser(SkillParserShared):
         ),
         row_index=True,
         function=_currency_extra,
+        fail_condition=True,
     )
 
     _COSMETIC_NAME_MAP = {
@@ -3456,10 +3551,10 @@ class ItemsParser(SkillParserShared):
     def _map_fragment_extra(self, infobox, base_item_type, map_fragment_mods):
         if map_fragment_mods["ModsKeys"]:
             i = 1
-            while infobox.get("implicit%s" % i) is not None:
+            while infobox.get("map_fragment_bonus%s" % i) is not None:
                 i += 1
             for mod in map_fragment_mods["ModsKeys"]:
-                infobox["implicit%s" % i] = mod["Id"]
+                infobox["map_fragment_bonus%s" % i] = mod["Id"]
                 i += 1
 
     _type_map_fragment_mods = _type_factory(
@@ -3835,6 +3930,30 @@ class ItemsParser(SkillParserShared):
         row_index=True,
     )
 
+    _type_corpse = _type_factory(
+        data_file="ItemisedCorpse.dat64",
+        index_column="BaseItem",
+        data_mapping=(
+            (
+                "MonsterAbilities",
+                {
+                    "template": "monster_abilities",
+                    "format": lambda v: "<br>".join(str(v).splitlines()),
+                    "condition": lambda v: v,
+                },
+            ),
+            (
+                "MonsterCategory",
+                {
+                    "template": "monster_category",
+                    "format": lambda v: v["Name"],
+                    "condition": lambda v: v,
+                },
+            ),
+        ),
+        row_index=True,
+    )
+
     _cls_map = dict()
     """
     This defines the expected data elements for an item class.
@@ -3976,7 +4095,7 @@ class ItemsParser(SkillParserShared):
         # 'LabyrinthMapItem': (),
         # Misc
         "Map": (_type_map,),
-        "MapFragment": (_type_map_fragment_mods,),
+        "MapFragment": (_type_currency, _type_map_fragment_mods,),
         "QuestItem": (_skip_quest_contracts,),
         "AtlasRegionUpgradeItem": (),
         "MetamorphosisDNA": (),
@@ -3989,6 +4108,8 @@ class ItemsParser(SkillParserShared):
         "HeistBlueprint": (),
         "Trinket": (),
         "HeistObjective": (),
+        "Breachstone": (_type_currency,),
+        "ItemisedCorpse": (_type_corpse,),
     }
 
     _conflict_active_skill_gems_map = {
@@ -4122,6 +4243,9 @@ class ItemsParser(SkillParserShared):
     def _conflict_incubator_stackable(self, infobox, base_item_type, rr, language):
         return base_item_type["Name"]
 
+    def _conflict_breachstone(self, infobox, base_item_type, rr, language):
+        return base_item_type["Name"]
+
     _conflict_resolver_map = {
         "Active Skill Gem": _conflict_active_skill_gems,
         "QuestItem": _conflict_quest_items,
@@ -4137,6 +4261,7 @@ class ItemsParser(SkillParserShared):
         "AtlasRegionUpgradeItem": _conflict_atlas_region_upgrade,
         "Incubator": _conflict_incubator,
         "IncubatorStackable": _conflict_incubator_stackable,
+        "Breachstone": _conflict_breachstone,
     }
 
     def _parse_class_filter(self, parsed_args):
@@ -4260,7 +4385,7 @@ class ItemsParser(SkillParserShared):
         # Get the base item of other language
         base_item_type = rr["BaseItemTypes.dat64"][base_item_type.rowid]
 
-        name = base_item_type["Name"]
+        name = infobox.get("name", base_item_type["Name"])
         cls_id = base_item_type["ItemClassesKey"]["Id"]
         m_id = base_item_type["Id"]
         override = self._NAME_OVERRIDE_BY_ID[language].get(m_id)
@@ -4343,97 +4468,195 @@ class ItemsParser(SkillParserShared):
             self._process_purchase_costs(base_item_type, infobox)
 
             funcs = self._cls_map.get(cls_id)
+            infoboxes = [infobox]
             if funcs:
-                fail = False
                 for f in funcs:
-                    if not f(self, infobox, base_item_type):
-                        fail = True
-                        console(
-                            f'Required extra info for item "{name}" with class id '
-                            f'"{cls_id}" not found. Skipping.',
-                            msg=Msg.warning,
-                        )
-                        break
-                if fail:
+                    next_infoboxes = []
+                    for item in infoboxes:
+                        result = f(self, item, base_item_type)
+                        if result is False:
+                            console(
+                                f'Required extra info for item "{name}" with class id '
+                                f'"{cls_id}" not found. Skipping.',
+                                msg=Msg.warning,
+                            )
+                            break
+                        elif result is True:
+                            # normal function - modified the infobox dict
+                            next_infoboxes.append(item)
+                        else:
+                            next_infoboxes.extend(result)
+                    infoboxes = next_infoboxes
+
+            for infobox in infoboxes:
+                # handle items with duplicate name entries
+                # Maps must be handled in any case due to unique naming style of
+                # pages
+                page = self._process_name_conflicts(infobox, base_item_type, self._language)
+                if page is None:
                     continue
+                if self._language != "English" and parsed_args.english_file_link:
+                    icon = self._process_name_conflicts(infobox, base_item_type, "English")
+                    if cls_id == "DivinationCard":
+                        key = "card_art"
+                    else:
+                        key = "inventory_icon"
 
-            # handle items with duplicate name entries
-            # Maps must be handled in any case due to unique naming style of
-            # pages
-            page = self._process_name_conflicts(infobox, base_item_type, self._language)
-            if page is None:
-                continue
-            if self._language != "English" and parsed_args.english_file_link:
-                icon = self._process_name_conflicts(infobox, base_item_type, "English")
-                if cls_id == "DivinationCard":
-                    key = "card_art"
-                else:
-                    key = "inventory_icon"
+                    if icon:
+                        infobox[key] = icon
+                    else:
+                        infobox[key] = self.rr2["BaseItemTypes.dat64"][base_item_type.rowid]["Name"]
 
-                if icon:
-                    infobox[key] = icon
-                else:
-                    infobox[key] = self.rr2["BaseItemTypes.dat64"][base_item_type.rowid]["Name"]
+                # putting this last since it's usually manually added
+                if m_id in self._DROP_DISABLED_ITEMS_BY_ID:
+                    infobox["drop_enabled"] = False
 
-            # putting this last since it's usually manually added
-            if m_id in self._DROP_DISABLED_ITEMS_BY_ID:
-                infobox["drop_enabled"] = False
+                inventory_icon = infobox.get("inventory_icon") or page
+                if ":" in inventory_icon:
+                    infobox["inventory_icon"] = inventory_icon.replace(":", "")
 
-            inventory_icon = infobox.get("inventory_icon") or page
-            if ":" in inventory_icon:
-                infobox["inventory_icon"] = inventory_icon.replace(":", "")
+                cond = ItemWikiCondition(
+                    data=infobox,
+                    cmdargs=parsed_args,
+                )
 
-            cond = ItemWikiCondition(
-                data=infobox,
-                cmdargs=parsed_args,
-            )
-
-            wiki_page = [
-                {
-                    "page": page,
-                    "condition": cond,
-                }
-            ]
-
-            if infobox.get("cosmetic_type", None) == "Armour Skin" and "Armour" not in page:
-                wiki_page.append(
+                wiki_page = [
                     {
-                        "page": page + " Armour",
+                        "page": page,
                         "condition": cond,
                     }
-                )
+                ]
 
-            ddsfile = base_item_type["ItemVisualIdentityKey"]["DDSFile"]
-            if ddsfile and ddsfile in self._PLACEHOLDER_IMAGES:
-                warnings.warn(
-                    'Item "%s" has placeholder icon art. Skipping.' % base_item_type["Name"]
-                )
-                continue
+                if infobox.get("cosmetic_type", None) == "Armour Skin" and "Armour" not in page:
+                    wiki_page.append(
+                        {
+                            "page": page + " Armour",
+                            "condition": cond,
+                        }
+                    )
 
-            r.add_result(
-                text=cond,
-                out_file="item_%s.txt" % page,
-                wiki_page=wiki_page,
-                wiki_message="Item exporter",
-            )
-
-            if parsed_args.store_images:
-                if not ddsfile:
+                ddsfile = base_item_type["ItemVisualIdentityKey"]["DDSFile"]
+                if ddsfile and ddsfile in self._PLACEHOLDER_IMAGES:
                     warnings.warn(
-                        'Missing 2d art inventory icon for item "%s"' % base_item_type["Name"]
+                        'Item "%s" has placeholder icon art. Skipping.' % base_item_type["Name"]
                     )
                     continue
 
-                self._write_dds(
-                    data=self.file_system.get_file(ddsfile),
-                    out_path=os.path.join(
-                        self._img_path,
-                        (infobox.get("inventory_icon") or page) + " inventory icon.dds",
-                    ),
-                    parsed_args=parsed_args,
+                r.add_result(
+                    text=cond,
+                    out_file="item_%s.txt" % page,
+                    wiki_page=wiki_page,
+                    wiki_message="Item exporter",
                 )
 
+                if parsed_args.store_images:
+                    if not ddsfile:
+                        warnings.warn(
+                            'Missing 2d art inventory icon for item "%s"' % base_item_type["Name"]
+                        )
+                        continue
+
+                    self._write_dds(
+                        data=self.file_system.get_file(ddsfile),
+                        out_path=os.path.join(
+                            self._img_path,
+                            (infobox.get("inventory_icon") or page) + " inventory icon.dds",
+                        ),
+                        parsed_args=parsed_args,
+                        shader=self._get_shader(infobox),
+                    )
+                else:
+                    infobox.pop("gem_shader", None)
+
         return r
+
+    def _get_shader(self, infobox: dict[str, str]):
+        if "gem_shader" not in infobox:
+            return None
+
+        attrs = {
+            k.lower(): int(infobox.get(f"{v}_percent", 0)) for k, v in self._attribute_map.items()
+        }
+        attr = max(attrs, key=attrs.get)
+        var = infobox.pop("gem_shader")
+
+        def _srgb_to_linear(img):
+            return np.piecewise(
+                img,
+                [img < 0.04045, img >= 0.04045],
+                [lambda v: v / 12.92, lambda v: ((v + 0.055) / 1.055) ** 2.4],
+            )
+
+        def _linear_to_srgb(img):
+            return np.piecewise(
+                img,
+                [img < 0.0031308, img >= 0.0031308],
+                [lambda v: v * 12.92, lambda v: 1.055 * v ** (1.0 / 2.4) - 0.055],
+            )
+
+        def shader(img: Image):
+            adorn = img.crop((0, 0, 78, 78))
+            base = img.crop((2 * 78, 0, 3 * 78, 78))
+            if var == 3:
+                return Image.alpha_composite(base, adorn)
+            const = SHADE_LUT[(attr, var)]
+
+            base_rgba = _srgb_to_linear(np.float32(np.asarray(base)) / 255.0)
+
+            # Shade algorithm:
+            # * compute luminance influence
+            #   float Luminance(float3 color)
+            #   {
+            #   	return dot(float3(0.299, 0.587, 0.114), color);
+            #   }
+            # 	const float luminance_influence = pow(Luminance(original_rgb), 0.02);
+            base_rgb = base_rgba[:, :, :3]
+            base_a = base_rgba[:, :, 3]
+            lum_f = (
+                base_rgba[:, :, 0] * 0.2999
+                + base_rgba[:, :, 1] * 0.587
+                + base_rgba[:, :, 2] * 0.114
+            )
+            lum_f = np.expand_dims(lum_f, axis=2)
+            luminance_influence = lum_f**0.02
+
+            # * convert to HSV
+            # Not using the same algorithm, leveraging matplotlib
+            hsv = matplotlib.colors.rgb_to_hsv(base_rgb)
+
+            # * shift HSV by XYZ, clamp H
+            # 	max(modf( hsv_sample.x + effect_params.x, ignore ), 0.024),
+            # 	saturate( hsv_sample.y + effect_params.y ),
+            # 	saturate( hsv_sample.z + effect_params.z )
+            h2 = np.maximum(np.modf(hsv[:, :, 0] + const.hue_factor)[0], 0.024)
+            s2 = np.clip(hsv[:, :, 1] + const.sat_factor, 0.0, 1.0)
+            v2 = np.clip(hsv[:, :, 2] + const.val_factor, 0.0, 1.0)
+
+            # * convert to "modified" RGB
+            # Not using the same HSV algorithm, leveraging matplotlib
+            modified_rgb = matplotlib.colors.hsv_to_rgb(np.stack([h2, s2, v2], axis=2))
+
+            # * mix original RGB and modified RGB by luminance influence weighted by W
+            # 	const float3 final_rgb = lerp(
+            # 		modified_rgb,
+            # 		original_rgb,
+            # 		lerp(luminance_influence, 0.f, effect_params.w)
+            # 	);
+            def lerp(a, b, f):
+                return a * (1.0 - f) + b * f
+
+            final_mix_f = lerp(luminance_influence, 0.0, const.lum_factor)
+            final_rgb = lerp(modified_rgb, base_rgb, final_mix_f)
+
+            shifted_rgba = np.dstack((final_rgb, base_a))
+            shifted_base = Image.fromarray(np.uint8(_linear_to_srgb(shifted_rgba) * 255.0), "RGBA")
+
+            # * desaturate, but the parameter for that seems to be 1 so won't bother
+            # 	return Desaturate(float4(final_rgb, 1.f) * original_a, saturation) * input.colour;
+
+            return Image.alpha_composite(shifted_base, adorn)
+
+        return shader
 
     def _print_item_rowid(self, export_row_count, base_item_type):
         # If we're printing less than 100 rows, print every rowid
